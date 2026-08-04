@@ -25,7 +25,11 @@ package reconciliation
 import (
 	"context"
 	"os"
+	"sync"
 
+	rpc "github.com/cs3org/go-cs3apis/cs3/rpc/v1beta1"
+	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
+	registry "github.com/cs3org/go-cs3apis/cs3/storage/registry/v1beta1"
 	"github.com/cs3org/reva/v3/pkg/appctx"
 	"github.com/cs3org/reva/v3/pkg/reconciliation"
 	"github.com/cs3org/reva/v3/pkg/rgrpc/todo/pool"
@@ -35,32 +39,51 @@ import (
 	"github.com/cs3org/reva/v3/pkg/sharedconf"
 	"github.com/cs3org/reva/v3/pkg/utils/cfg"
 	"github.com/pkg/errors"
-	"github.com/rs/zerolog"
 )
 
 func init() {
 	rserverless.Register("reconciliation", New)
 }
 
+// The names a job is enabled and configured under.
+const (
+	jobOrphan  = "orphan"
+	jobShallow = "shallow"
+)
+
 type config struct {
-	reconciliation.Config `mapstructure:",squash"`
-	// Schedule is the interval the orphan job runs on, e.g. "@daily".
-	Schedule string `mapstructure:"schedule" validate:"required"`
+	// Jobs are the jobs to run, by name. Each one is configured in its own
+	// section, so enabling a job means listing it here and giving it a
+	// schedule.
+	Jobs []string `mapstructure:"jobs"`
+	// GatewaySVC is the gateway the jobs resolve resources, recipients and
+	// storage providers through. Falls back to [shared].
+	GatewaySVC string `mapstructure:"gatewaysvc"`
 	// DB is the share database, the same block the sql share driver takes.
 	// Unset fields fall back to [shared].
 	DB map[string]any `mapstructure:"db"`
+	// Orphan configures the orphan job.
+	Orphan reconciliation.Config `mapstructure:"orphan"`
+	// Shallow configures the shallow job.
+	Shallow reconciliation.Config `mapstructure:"shallow"`
 }
 
-// ApplyDefaults defaults the embedded reconciliation config, which cfg.Decode
-// only does for the struct it is given.
 func (c *config) ApplyDefaults() {
-	c.Config.ApplyDefaults()
+	c.GatewaySVC = sharedconf.GetGatewaySVC(c.GatewaySVC)
+	// a file per job, so a run of one is never interleaved with a run of the
+	// other and either can be pointed somewhere else on its own.
+	if c.Orphan.LogFile == "" {
+		c.Orphan.LogFile = "/var/log/revad/reconciliation-orphan.log"
+	}
+	if c.Shallow.LogFile == "" {
+		c.Shallow.LogFile = "/var/log/revad/reconciliation-shallow.log"
+	}
 }
 
 type svc struct {
-	log *zerolog.Logger
-	// jobLog is the job's log file, nil when the job logs to a standard stream.
-	jobLog *os.File
+	// logs are the job log files, one per job that writes to a file rather than
+	// to a standard stream.
+	logs []*os.File
 }
 
 // New builds the reconciliation service. It registers the jobs right away
@@ -70,10 +93,13 @@ type svc struct {
 // The stores are the gorm-backed sql managers: the jobs read and write the
 // share tables directly, so unlike the grpc services this one has no driver
 // indirection to offer.
-func New(ctx context.Context, m map[string]any) (rserverless.Service, error) {
+func New(ctx context.Context, m map[string]any) (_ rserverless.Service, err error) {
 	var c config
 	if err := cfg.Decode(m, &c); err != nil {
 		return nil, err
+	}
+	if len(c.Jobs) == 0 {
+		return nil, errors.Errorf("reconciliation: no jobs enabled, set jobs to any of %q, %q", jobOrphan, jobShallow)
 	}
 
 	sm, err := sql.NewShareManager(ctx, c.DB)
@@ -84,7 +110,7 @@ func New(ctx context.Context, m map[string]any) (rserverless.Service, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "reconciliation: opening the public link store")
 	}
-	gw, err := pool.GetGatewayServiceClient(pool.Endpoint(sharedconf.GetGatewaySVC("")))
+	gw, err := pool.GetGatewayServiceClient(pool.Endpoint(c.GatewaySVC))
 	if err != nil {
 		return nil, errors.Wrap(err, "reconciliation: getting the gateway client")
 	}
@@ -98,43 +124,147 @@ func New(ctx context.Context, m map[string]any) (rserverless.Service, error) {
 		return nil, errors.Errorf("reconciliation: public link manager %T cannot be reconciled", pm)
 	}
 
-	jobLog, logFile, err := reconciliation.OpenLog(c.LogFile)
-	if err != nil {
-		return nil, err
-	}
-
-	job := &reconciliation.OrphanJob{
-		Shares:  shares,
-		Links:   links,
-		Gateway: gw,
-		Log:     jobLog,
-		DryRun:  c.DryRun,
-	}
-	if err := rjobs.RegisterPeriodic(job.Periodic(c.Schedule)); err != nil {
-		if logFile != nil {
-			_ = logFile.Close()
-		}
-		return nil, errors.Wrap(err, "reconciliation: registering the orphan job")
-	}
-
 	log := appctx.GetLogger(ctx)
-	log.Info().
-		Str("schedule", c.Schedule).
-		Str("log_file", c.LogFile).
-		Bool("dry_run", c.DryRun).
-		Msg("reconciliation: orphan job registered")
+	s := &svc{}
+	// a job that never got registered still opened its log, so a failure part
+	// way through the list has files to give back.
+	defer func() {
+		if err != nil {
+			_ = s.closeLogs()
+		}
+	}()
 
-	return &svc{log: log, jobLog: logFile}, nil
+	for _, name := range c.Jobs {
+		var jc reconciliation.Config
+		switch name {
+		case jobOrphan:
+			jc = c.Orphan
+		case jobShallow:
+			jc = c.Shallow
+		default:
+			return nil, errors.Errorf("reconciliation: unknown job %q, want %q or %q", name, jobOrphan, jobShallow)
+		}
+		if jc.Schedule == "" {
+			return nil, errors.Errorf("reconciliation: job %q has no schedule", name)
+		}
+
+		jobLog, logFile, err := reconciliation.OpenLog(jc.LogFile)
+		if err != nil {
+			return nil, err
+		}
+		if logFile != nil {
+			s.logs = append(s.logs, logFile)
+		}
+
+		var periodic rjobs.Periodic
+		switch name {
+		case jobOrphan:
+			job := &reconciliation.OrphanJob{
+				Shares:  shares,
+				Links:   links,
+				Gateway: gw,
+				Log:     jobLog,
+				DryRun:  jc.DryRun,
+			}
+			periodic = job.Periodic(jc.Schedule)
+		case jobShallow:
+			// the storage registry is served by the gateway, which is also
+			// where the gateway itself looks it up when no address is
+			// configured.
+			reg, err := pool.GetStorageRegistryClient(pool.Endpoint(c.GatewaySVC))
+			if err != nil {
+				return nil, errors.Wrap(err, "reconciliation: getting the storage registry client")
+			}
+			job := &reconciliation.ShallowJob{
+				Shares:  shares,
+				Gateway: gw,
+				Grants: (&storageProviders{
+					reg:     reg,
+					clients: map[string]reconciliation.GrantStore{},
+				}).grants,
+				Log:    jobLog,
+				DryRun: jc.DryRun,
+			}
+			periodic = job.Periodic(jc.Schedule)
+		}
+
+		if err := rjobs.RegisterPeriodic(periodic); err != nil {
+			return nil, errors.Wrapf(err, "reconciliation: registering %s", periodic.Name)
+		}
+		log.Info().
+			Str("job", periodic.Name).
+			Str("schedule", jc.Schedule).
+			Str("log_file", jc.LogFile).
+			Bool("dry_run", jc.DryRun).
+			Msg("reconciliation: job registered")
+	}
+
+	return s, nil
 }
 
-// Start is a no-op: the jobs service owns the runner that fires the job.
+// storageProviders hands out the grant API of the storage provider hosting a
+// given storage. The grant calls are not part of the gateway API, and
+// deliberately so: a client that wants to change who can reach a resource goes
+// through CreateShare and friends. The shallow job is the exception, it repairs
+// the ACLs those calls left behind, so it does what the gateway does internally
+// and addresses the provider itself.
+type storageProviders struct {
+	reg registry.RegistryAPIClient
+
+	mu sync.Mutex
+	// clients holds the provider client of each storage seen so far. A provider
+	// address only changes when the registry is reconfigured, which needs a
+	// restart anyway, and a run would otherwise look the same storage up twice
+	// per share.
+	clients map[string]reconciliation.GrantStore
+}
+
+// grants returns the grant API of the provider hosting storageID.
+func (p *storageProviders) grants(ctx context.Context, storageID string) (reconciliation.GrantStore, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.clients[storageID]; ok {
+		return c, nil
+	}
+
+	res, err := p.reg.GetStorageProviders(ctx, &registry.GetStorageProvidersRequest{
+		Ref: &provider.Reference{ResourceId: &provider.ResourceId{StorageId: storageID}},
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "reconciliation: looking up the storage provider")
+	}
+	if code := res.GetStatus().GetCode(); code != rpc.Code_CODE_OK {
+		return nil, errors.Errorf("reconciliation: looking up the storage provider: %s: %s", code, res.GetStatus().GetMessage())
+	}
+	if len(res.GetProviders()) == 0 {
+		return nil, errors.Errorf("reconciliation: no storage provider for %q", storageID)
+	}
+
+	c, err := pool.GetStorageProviderServiceClient(pool.Endpoint(res.GetProviders()[0].GetAddress()))
+	if err != nil {
+		return nil, errors.Wrap(err, "reconciliation: getting the storage provider client")
+	}
+	p.clients[storageID] = c
+	return c, nil
+}
+
+// Start is a no-op: the jobs service owns the runner that fires the jobs.
 func (s *svc) Start() {}
 
-// Close closes the job's log. The runner is stopped by the jobs service, so no
+// Close closes the job logs. The runner is stopped by the jobs service, so no
 // run is in flight by the time this is called.
 func (s *svc) Close(ctx context.Context) error {
-	if s.jobLog == nil {
-		return nil
+	return s.closeLogs()
+}
+
+// closeLogs closes every log opened so far and reports the first failure.
+func (s *svc) closeLogs() error {
+	var err error
+	for _, f := range s.logs {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
 	}
-	return s.jobLog.Close()
+	s.logs = nil
+	return err
 }
