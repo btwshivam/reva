@@ -11,6 +11,9 @@ rescheduled, or pointed at another log, without touching the other.
 ```toml
 [serverless.services.reconciliation]
 jobs = ["orphan", "shallow"]
+service_user_name = "cboxreco"
+service_user_uid  = 12345
+service_user_gid  = 2766
 
 [serverless.services.reconciliation.orphan]
 schedule = "@daily"      # "@every <dur>" | "@hourly" | "@daily" | "@weekly"
@@ -24,10 +27,20 @@ log_file = "/var/log/revad/reconciliation-shallow.log"
 ```
 
 A job runs only if it is listed in `jobs`, and every listed job needs a
-`schedule`. `log_file` defaults to the path shown above for each. `gatewaysvc`
-and the `[serverless.services.reconciliation.db]` section, which takes the same
-keys as the `sql` share driver, both fall back to `[shared]`, so both can
-normally be omitted.
+`schedule`. `log_file` defaults to the path shown above for each. `gatewaysvc`,
+`jwt_secret` and the `[serverless.services.reconciliation.db]` section, which
+takes the same keys as the `sql` share driver, all fall back to `[shared]`, so
+they can normally be omitted.
+
+## Identity
+
+The jobs runner hands a run a bare context, so each run mints itself a token for
+`service_user_name` and sends it with every call. The three `service_user_*`
+keys are required and the account has to be a real one: EOS reads the ACLs of a
+node as the caller before handing them out, and its driver refuses a caller
+whose uid or gid is zero, so `root` does not work. If `skip_user_groups_in_token`
+is set, the account also has to resolve in the user provider, since the auth
+interceptor looks its groups up.
 
 ## Jobs
 

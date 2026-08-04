@@ -87,6 +87,11 @@ type ShallowJob struct {
 	// Gateway resolves the path of a shared resource and the identity of its
 	// recipient.
 	Gateway gateway.GatewayAPIClient
+	// Auth puts the identity the job acts as on the run context. The jobs
+	// runner hands a run a bare context and both the gateway and the storage
+	// providers reject a call without a token, so every run needs one. A nil
+	// Auth leaves the context alone.
+	Auth func(ctx context.Context) (context.Context, error)
 	// Grants returns the grant API of the storage provider hosting storageID.
 	// It is a function because the grant calls are not part of the gateway API,
 	// so the provider hosting the resource has to be looked up first, which is
@@ -182,6 +187,13 @@ func (j *ShallowJob) Run(ctx context.Context) (ShallowReport, error) {
 	runID := uuid.New().String()
 	l := base.With().Str("job", ShallowJobName).Str("run", runID).Logger()
 	log := &l
+
+	if j.Auth != nil {
+		var err error
+		if ctx, err = j.Auth(ctx); err != nil {
+			return ShallowReport{}, err
+		}
+	}
 
 	shares, err := j.Shares.ListModelShares(nil, nil, true)
 	if err != nil {

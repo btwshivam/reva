@@ -27,18 +27,24 @@ import (
 	"os"
 	"sync"
 
+	authpb "github.com/cs3org/go-cs3apis/cs3/auth/provider/v1beta1"
+	userpb "github.com/cs3org/go-cs3apis/cs3/identity/user/v1beta1"
 	rpc "github.com/cs3org/go-cs3apis/cs3/rpc/v1beta1"
 	provider "github.com/cs3org/go-cs3apis/cs3/storage/provider/v1beta1"
 	registry "github.com/cs3org/go-cs3apis/cs3/storage/registry/v1beta1"
 	"github.com/cs3org/reva/v3/pkg/appctx"
+	"github.com/cs3org/reva/v3/pkg/auth/scope"
 	"github.com/cs3org/reva/v3/pkg/reconciliation"
 	"github.com/cs3org/reva/v3/pkg/rgrpc/todo/pool"
 	"github.com/cs3org/reva/v3/pkg/rjobs"
 	"github.com/cs3org/reva/v3/pkg/rserverless"
 	"github.com/cs3org/reva/v3/pkg/share/manager/sql"
 	"github.com/cs3org/reva/v3/pkg/sharedconf"
+	"github.com/cs3org/reva/v3/pkg/token"
+	"github.com/cs3org/reva/v3/pkg/token/manager/jwt"
 	"github.com/cs3org/reva/v3/pkg/utils/cfg"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc/metadata"
 )
 
 func init() {
@@ -59,6 +65,17 @@ type config struct {
 	// GatewaySVC is the gateway the jobs resolve resources, recipients and
 	// storage providers through. Falls back to [shared].
 	GatewaySVC string `mapstructure:"gatewaysvc"`
+	// JWTSecret signs the token the jobs authenticate their own calls with.
+	// Falls back to [shared].
+	JWTSecret string `mapstructure:"jwt_secret"`
+	// ServiceUserName is the account the jobs act as. It has to be known to the
+	// storage: the EOS driver reads the ACLs of a node as the caller before it
+	// hands them out.
+	ServiceUserName string `mapstructure:"service_user_name" validate:"required"`
+	// ServiceUserUID and ServiceUserGID are that account's ids. The EOS driver
+	// refuses a caller without them, so neither may be zero.
+	ServiceUserUID int64 `mapstructure:"service_user_uid" validate:"required"`
+	ServiceUserGID int64 `mapstructure:"service_user_gid" validate:"required"`
 	// DB is the share database, the same block the sql share driver takes.
 	// Unset fields fall back to [shared].
 	DB map[string]any `mapstructure:"db"`
@@ -70,6 +87,7 @@ type config struct {
 
 func (c *config) ApplyDefaults() {
 	c.GatewaySVC = sharedconf.GetGatewaySVC(c.GatewaySVC)
+	c.JWTSecret = sharedconf.GetJWTSecret(c.JWTSecret)
 	// a file per job, so a run of one is never interleaved with a run of the
 	// other and either can be pointed somewhere else on its own.
 	if c.Orphan.LogFile == "" {
@@ -113,6 +131,30 @@ func New(ctx context.Context, m map[string]any) (_ rserverless.Service, err erro
 	gw, err := pool.GetGatewayServiceClient(pool.Endpoint(c.GatewaySVC))
 	if err != nil {
 		return nil, errors.Wrap(err, "reconciliation: getting the gateway client")
+	}
+
+	tokens, err := jwt.New(map[string]any{"secret": c.JWTSecret})
+	if err != nil {
+		return nil, errors.Wrap(err, "reconciliation: building the token manager")
+	}
+	// the jobs read and write across the whole namespace, so the token carries
+	// the owner scope, the same one an interactive session gets.
+	scopes, err := scope.AddOwnerScope(nil)
+	if err != nil {
+		return nil, errors.Wrap(err, "reconciliation: building the token scope")
+	}
+	identity := &serviceUser{
+		tokens: tokens,
+		scope:  scopes,
+		user: &userpb.User{
+			Id: &userpb.UserId{
+				OpaqueId: c.ServiceUserName,
+				Type:     userpb.UserType_USER_TYPE_PRIMARY,
+			},
+			Username:  c.ServiceUserName,
+			UidNumber: c.ServiceUserUID,
+			GidNumber: c.ServiceUserGID,
+		},
 	}
 
 	shares, ok := sm.(reconciliation.ShareStore)
@@ -163,6 +205,7 @@ func New(ctx context.Context, m map[string]any) (_ rserverless.Service, err erro
 				Shares:  shares,
 				Links:   links,
 				Gateway: gw,
+				Auth:    identity.authenticate,
 				Log:     jobLog,
 				DryRun:  jc.DryRun,
 			}
@@ -178,6 +221,7 @@ func New(ctx context.Context, m map[string]any) (_ rserverless.Service, err erro
 			job := &reconciliation.ShallowJob{
 				Shares:  shares,
 				Gateway: gw,
+				Auth:    identity.authenticate,
 				Grants: (&storageProviders{
 					reg:     reg,
 					clients: map[string]reconciliation.GrantStore{},
@@ -200,6 +244,26 @@ func New(ctx context.Context, m map[string]any) (_ rserverless.Service, err erro
 	}
 
 	return s, nil
+}
+
+// serviceUser is the identity the jobs act as. The jobs runner hands a run a
+// bare context, and every gateway and storage provider call goes through the
+// auth interceptor, which rejects a call without a token.
+type serviceUser struct {
+	tokens token.Manager
+	user   *userpb.User
+	scope  map[string]*authpb.Scope
+}
+
+// authenticate returns ctx carrying a token for the service user. It is minted
+// per run rather than at startup because a token expires and these jobs are
+// scheduled days apart.
+func (s *serviceUser) authenticate(ctx context.Context) (context.Context, error) {
+	tkn, err := s.tokens.MintToken(ctx, s.user, s.scope)
+	if err != nil {
+		return nil, errors.Wrap(err, "reconciliation: minting the service token")
+	}
+	return metadata.AppendToOutgoingContext(ctx, appctx.TokenHeader, tkn), nil
 }
 
 // storageProviders hands out the grant API of the storage provider hosting a

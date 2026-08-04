@@ -114,6 +114,10 @@ type OrphanJob struct {
 	Links PublicLinkStore
 	// Gateway resolves resource and recipient existence.
 	Gateway gateway.GatewayAPIClient
+	// Auth puts the identity the job acts as on the run context. The jobs
+	// runner hands a run a bare context and the gateway rejects a call without
+	// a token, so every run needs one. A nil Auth leaves the context alone.
+	Auth func(ctx context.Context) (context.Context, error)
 	// Log is the job's own log, see OpenLog. When nil the job falls back to the
 	// logger in the run context.
 	Log *zerolog.Logger
@@ -188,6 +192,13 @@ func (j *OrphanJob) Run(ctx context.Context) (OrphanReport, error) {
 	runID := uuid.New().String()
 	l := base.With().Str("job", OrphanJobName).Str("run", runID).Logger()
 	log := &l
+
+	if j.Auth != nil {
+		var err error
+		if ctx, err = j.Auth(ctx); err != nil {
+			return OrphanReport{}, err
+		}
+	}
 
 	entries, err := j.entries()
 	if err != nil {
