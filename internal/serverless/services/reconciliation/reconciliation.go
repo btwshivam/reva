@@ -202,12 +202,13 @@ func New(ctx context.Context, m map[string]any) (_ rserverless.Service, err erro
 		switch name {
 		case jobOrphan:
 			job := &reconciliation.OrphanJob{
-				Shares:  shares,
-				Links:   links,
-				Gateway: gw,
-				Auth:    identity.authenticate,
-				Log:     jobLog,
-				DryRun:  jc.DryRun,
+				Shares:     shares,
+				Links:      links,
+				Gateway:    gw,
+				Auth:       identity.authenticate,
+				Log:        jobLog,
+				DryRun:     jc.DryRun,
+				RunOnStart: jc.RunOnStart,
 			}
 			periodic = job.Periodic(jc.Schedule)
 		case jobShallow:
@@ -226,8 +227,9 @@ func New(ctx context.Context, m map[string]any) (_ rserverless.Service, err erro
 					reg:     reg,
 					clients: map[string]reconciliation.GrantStore{},
 				}).grants,
-				Log:    jobLog,
-				DryRun: jc.DryRun,
+				Log:        jobLog,
+				DryRun:     jc.DryRun,
+				RunOnStart: jc.RunOnStart,
 			}
 			periodic = job.Periodic(jc.Schedule)
 		}
@@ -240,6 +242,7 @@ func New(ctx context.Context, m map[string]any) (_ rserverless.Service, err erro
 			Str("schedule", jc.Schedule).
 			Str("log_file", jc.LogFile).
 			Bool("dry_run", jc.DryRun).
+			Bool("run_on_start", jc.RunOnStart).
 			Msg("reconciliation: job registered")
 	}
 

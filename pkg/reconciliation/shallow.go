@@ -102,6 +102,8 @@ type ShallowJob struct {
 	Log *zerolog.Logger
 	// DryRun, when set, reports the grants it would write without writing any.
 	DryRun bool
+	// RunOnStart, when set, fires the job once as soon as the runner starts.
+	RunOnStart bool
 }
 
 // ActionKind is what the job did to an ACL entry. There is no remove: the job
@@ -543,10 +545,11 @@ func (j *ShallowJob) write(ctx context.Context, rs sharehierarchy.ResolvedShare,
 // mutates the storage, and skips a fire if the previous run is still going.
 func (j *ShallowJob) Periodic(schedule string) rjobs.Periodic {
 	return rjobs.Periodic{
-		Name:     ShallowJobName,
-		Schedule: schedule,
-		Scope:    rjobs.ScopeLeader,
-		Overlap:  rjobs.Skip,
+		Name:       ShallowJobName,
+		Schedule:   schedule,
+		Scope:      rjobs.ScopeLeader,
+		Overlap:    rjobs.Skip,
+		RunOnStart: j.RunOnStart,
 		Run: func(ctx context.Context) error {
 			_, err := j.Run(ctx)
 			return err

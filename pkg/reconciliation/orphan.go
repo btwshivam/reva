@@ -123,6 +123,8 @@ type OrphanJob struct {
 	Log *zerolog.Logger
 	// DryRun, when set, reports what would be orphaned without mutating.
 	DryRun bool
+	// RunOnStart, when set, fires the job once as soon as the runner starts.
+	RunOnStart bool
 }
 
 // entry is one share-like row to check. Shares and public links are flattened
@@ -403,10 +405,11 @@ func existsFromStatus(s *rpc.Status) (bool, error) {
 // going.
 func (j *OrphanJob) Periodic(schedule string) rjobs.Periodic {
 	return rjobs.Periodic{
-		Name:     OrphanJobName,
-		Schedule: schedule,
-		Scope:    rjobs.ScopeLeader,
-		Overlap:  rjobs.Skip,
+		Name:       OrphanJobName,
+		Schedule:   schedule,
+		Scope:      rjobs.ScopeLeader,
+		Overlap:    rjobs.Skip,
+		RunOnStart: j.RunOnStart,
 		Run: func(ctx context.Context) error {
 			_, err := j.Run(ctx)
 			return err
