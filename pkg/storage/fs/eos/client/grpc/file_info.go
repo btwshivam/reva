@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"path"
 	"strconv"
 	"strings"
@@ -13,7 +14,31 @@ import (
 	"github.com/cs3org/reva/v3/pkg/errtypes"
 	eosclient "github.com/cs3org/reva/v3/pkg/storage/fs/eos/client"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 )
+
+// mdRecvError classifies the error a streaming MD Recv returned. An MDResponse
+// carries no error of its own, so the outcome of a lookup is only readable from
+// the stream: EOS reports a missing entry either by closing the stream without
+// sending one, which surfaces as io.EOF, or with a NOT_FOUND status. Both mean
+// the resource is gone.
+//
+// Every other status is a real failure - an unreachable MGM, a timeout, a
+// rejected caller - and is returned unchanged so it stays distinguishable.
+// The callers above depend on the difference: the storage provider turns a
+// not-found into CODE_NOT_FOUND and anything else into CODE_INTERNAL, which is
+// what tells a caller "this resource no longer exists" apart from "we could not
+// find out".
+func mdRecvError(err error, target string) error {
+	if errors.Is(err, io.EOF) {
+		return errtypes.NotFound(target)
+	}
+	if st, ok := grpcstatus.FromError(err); ok && st.Code() == codes.NotFound {
+		return errtypes.NotFound(target)
+	}
+	return err
+}
 
 // GetFileInfoByInode returns the FileInfo by the given inode.
 func (c *Client) GetFileInfoByInode(ctx context.Context, auth eosclient.Authorization, inode uint64) (*eosclient.FileInfo, error) {
@@ -48,7 +73,7 @@ func (c *Client) GetFileInfoByInode(ctx context.Context, auth eosclient.Authoriz
 	rsp, err := resp.Recv()
 	if err != nil {
 		log.Error().Err(err).Uint64("inode", inode).Str("err", err.Error()).Send()
-		return nil, err
+		return nil, mdRecvError(err, fmt.Sprintf("inode: '%d'", inode))
 	}
 
 	if rsp == nil {
@@ -100,12 +125,7 @@ func (c *Client) GetFileInfoByPath(ctx context.Context, auth eosclient.Authoriza
 	if err != nil {
 		log.Error().Str("func", "GetFileInfoByPath").Err(err).Str("path", path).Str("err", err.Error()).Msg("")
 
-		// FIXME: this is very bad and poisonous for the project!!!!!!!
-		// Apparently here we have to assume that an error in Recv() means "file not found"
-		// - "File not found is not an error", it's a legitimate result of a legitimate check
-		// - Assuming that any error means file not found is doubly poisonous
-		return nil, errtypes.NotFound(err.Error())
-		// return nil, nil
+		return nil, mdRecvError(err, fmt.Sprintf("path: %s", path))
 	}
 
 	if rsp == nil {
