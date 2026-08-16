@@ -325,3 +325,44 @@ func TestListPublicSharesWithFilters(t *testing.T) {
 		t.Errorf("Expected share ID %s, got %s", share.Id.OpaqueId, shares[0].Id.OpaqueId)
 	}
 }
+
+// ListPublicShares must return only the links created by the calling user, even
+// when no filter is given.
+func TestListPublicSharesScoping(t *testing.T) {
+	tests := []struct {
+		name      string
+		caller    string
+		wantCount int
+	}{
+		{name: "owner sees own link", caller: "owner", wantCount: 1},
+		{name: "other user sees none", caller: "other", wantCount: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, err, teardown := setupSuiteLinks(t)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer teardown(t)
+
+			ownerCtx := getUserContext("owner")
+			owner, _ := appctx.ContextGetUser(ownerCtx)
+			file := getRandomFile(owner)
+			if _, err := mgr.CreatePublicShare(ownerCtx, nil, file, getTestPublicLinkGrant(""), "", false, false, ""); err != nil {
+				t.Fatal(err)
+			}
+
+			callerCtx := getUserContext(tt.caller)
+			caller, _ := appctx.ContextGetUser(callerCtx)
+			shares, err := mgr.ListPublicShares(callerCtx, caller, nil, file, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(shares) != tt.wantCount {
+				t.Fatalf("ListPublicShares() returned %d links, want %d", len(shares), tt.wantCount)
+			}
+		})
+	}
+}

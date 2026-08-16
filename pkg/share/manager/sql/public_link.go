@@ -250,9 +250,24 @@ func (m *PublicShareMgr) GetPublicShare(ctx context.Context, u *user.User, ref *
 	return l, nil
 }
 
+func hasLinkScopeFilter(filters []*link.ListPublicSharesRequest_Filter) bool {
+	for _, f := range filters {
+		switch f.GetType() {
+		case link.ListPublicSharesRequest_Filter_TYPE_CREATOR, link.ListPublicSharesRequest_Filter_TYPE_OWNER, link.ListPublicSharesRequest_Filter_TYPE_RESOURCE_ID:
+			return true
+		}
+	}
+	return false
+}
+
 // List public shares that match the given filters
 func (m *PublicShareMgr) ListPublicShares(ctx context.Context, u *user.User, filters []*link.ListPublicSharesRequest_Filter, md *provider.ResourceInfo, sign bool) ([]*link.PublicShare, error) {
-	links, err := m.ListPublicLinks(nil, filters, nil, false)
+	// no scope filter: return only the caller's own links
+	scope := u
+	if hasLinkScopeFilter(filters) {
+		scope = nil
+	}
+	links, err := m.ListPublicLinks(scope, filters, nil, false)
 
 	if err != nil {
 		return nil, err
