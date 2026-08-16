@@ -674,3 +674,71 @@ func TestListSharesWithMultipleFilters(t *testing.T) {
 		t.Errorf("Expected 1 share, got %d", len(shares))
 	}
 }
+
+// ListShares must return only the shares created by the calling user, even when
+// no filter is given.
+func TestListSharesScoping(t *testing.T) {
+	tests := []struct {
+		name      string
+		caller    string
+		wantCount int
+	}{
+		{name: "owner sees own share", caller: "owner", wantCount: 1},
+		{name: "other user sees none", caller: "other", wantCount: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, err, teardown := setupSuiteShares(t)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer teardown(t)
+
+			ownerCtx := getUserContext("owner")
+			owner, _ := appctx.ContextGetUser(ownerCtx)
+			file := getRandomFile(owner)
+			if _, err := mgr.Share(ownerCtx, file, getUserShareGrant("1000", "file")); err != nil {
+				t.Fatal(err)
+			}
+
+			shares, err := mgr.ListShares(getUserContext(tt.caller), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(shares) != tt.wantCount {
+				t.Fatalf("ListShares() returned %d shares, want %d", len(shares), tt.wantCount)
+			}
+		})
+	}
+}
+
+// the project-admin path: a resource-scoped listing still returns other users' shares
+func TestListSharesResourceFilterStaysUnscoped(t *testing.T) {
+	mgr, err, teardown := setupSuiteShares(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer teardown(t)
+
+	ownerCtx := getUserContext("owner")
+	owner, _ := appctx.ContextGetUser(ownerCtx)
+	file := getRandomFile(owner)
+	if _, err := mgr.Share(ownerCtx, file, getUserShareGrant("1000", "file")); err != nil {
+		t.Fatal(err)
+	}
+
+	// a different user lists that resource's shares (the admin case)
+	filters := []*collaboration.Filter{{
+		Type: collaboration.Filter_TYPE_RESOURCE_ID,
+		Term: &collaboration.Filter_ResourceId{ResourceId: file.Id},
+	}}
+	shares, err := mgr.ListShares(getUserContext("other"), filters)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(shares) != 1 {
+		t.Fatalf("resource-filtered ListShares returned %d shares, want 1 (admin path must stay unscoped)", len(shares))
+	}
+}

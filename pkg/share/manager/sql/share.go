@@ -205,8 +205,23 @@ func (m *ShareMgr) UpdateShare(ctx context.Context, ref *collaboration.ShareRefe
 	return m.GetShare(ctx, ref)
 }
 
+func hasShareScopeFilter(filters []*collaboration.Filter) bool {
+	for _, f := range filters {
+		switch f.GetType() {
+		case collaboration.Filter_TYPE_CREATOR, collaboration.Filter_TYPE_OWNER, collaboration.Filter_TYPE_RESOURCE_ID:
+			return true
+		}
+	}
+	return false
+}
+
 func (m *ShareMgr) ListShares(ctx context.Context, filters []*collaboration.Filter) ([]*collaboration.Share, error) {
-	shares, err := m.ListModelShares(nil, filters, true)
+	// no scope filter: return only the caller's own shares
+	var scope *user.User
+	if !hasShareScopeFilter(filters) {
+		scope = appctx.ContextMustGetUser(ctx)
+	}
+	shares, err := m.ListModelShares(scope, filters, true)
 	if err != nil {
 		return nil, err
 	}
