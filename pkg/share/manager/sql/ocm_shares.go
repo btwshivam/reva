@@ -575,6 +575,11 @@ func (m *mgr) getByToken(ctx context.Context, token string) (*ocm.Share, error) 
 		return nil, err
 	}
 
+	// expired shares must not resolve
+	if shareModel.Expiration.Valid && time.Now().After(shareModel.Expiration.V) {
+		return nil, share.ErrShareNotFound
+	}
+
 	am, err := m.getAccessMethods(ctx, int(shareModel.Id))
 	if err != nil {
 		return nil, err

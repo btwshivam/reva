@@ -317,6 +317,11 @@ func (m *mgr) GetShare(ctx context.Context, user *userpb.User, ref *ocm.ShareRef
 func (m *mgr) getByToken(ctx context.Context, token string) (*ocm.Share, error) {
 	for _, share := range m.model.Shares {
 		if share.Token == token {
+			// expired shares must not resolve
+			if share.Expiration != nil && share.Expiration.Seconds != 0 &&
+				time.Now().After(time.Unix(int64(share.Expiration.Seconds), 0)) {
+				return nil, errtypes.NotFound(token)
+			}
 			return share, nil
 		}
 	}

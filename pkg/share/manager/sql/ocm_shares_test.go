@@ -915,3 +915,39 @@ func TestUpdateReceivedOCMShareHidden(t *testing.T) {
 		t.Fatal("expected share to not be hidden after unhide")
 	}
 }
+
+// GetShare by token must honour the OCM share expiration.
+func TestGetOCMShareByTokenExpiry(t *testing.T) {
+	tests := []struct {
+		name    string
+		expires time.Time
+		wantErr bool
+	}{
+		{name: "valid share resolves", expires: time.Now().Add(time.Hour), wantErr: false},
+		{name: "expired share rejected", expires: time.Now().Add(-time.Hour), wantErr: true},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mgr, err, teardown := setupSuiteOcmShares(t)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer teardown(t)
+
+			ctx := getUserContext("123456")
+			user, _ := appctx.ContextGetUser(ctx)
+			token := "token-" + string(rune('a'+i))
+			share := getOcmShare(getOcmAccessMethods("viewer"), getUserOcmShareGrantee("sharee1"), user.Id, getResourceId(), token)
+			share.Expiration = &typesv1beta1.Timestamp{Seconds: uint64(tt.expires.Unix())}
+			if _, err := storeOcmShareWithID(mgr, ctx, share); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err = mgr.GetShare(ctx, user, &ocm.ShareReference{Spec: &ocm.ShareReference_Token{Token: token}})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("GetShare() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
